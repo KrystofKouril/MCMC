@@ -14,6 +14,7 @@ sp500['Next_Open_Return'] = sp500['Open'] / sp500['Close'].shift(1) - 1
 # Calculate close to close returns
 sp500['Close_to_Close_Return'] = sp500['Close'].pct_change()
 
+# Calculate logarithmic returns
 sp500['Log_Return'] = np.log(sp500['Close'] / sp500['Close'].shift(1))
 
 # Add volume feature
@@ -21,8 +22,6 @@ sp500['Volume_Change'] = sp500['Volume'].pct_change()
 
 # Calculate volatility (20-day rolling standard deviation of returns)
 sp500['Volatility'] = sp500['Log_Return'].rolling(window=20).std()
-
-# Categories shifted
 
 # Categorize returns
 def categorize_next_open_state(ret):
