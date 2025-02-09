@@ -94,14 +94,14 @@ def log_prior(state):
 def adaptive_proposal(current_state, iteration, accepted):
     current_index = states.index(current_state)
 
-    if iteration > 100:
-        acceptance_rate = sum(accepted[-100:]) / 100
+    if iteration > 1000:
+        acceptance_rate = sum(accepted[-1000:]) / 1000
         if acceptance_rate > 0.234: # Optimal acceptance rate for many MCMC applications
             probs = [0.1 if i != current_index else 0.6 for i in range(5)]
         else:
             probs = [0.05 if i != current_index else 0.8 for i in range(5)]
     else:
-        probs = [0.2, 0.2, 0.2, 0.2, 0.2] # sus
+        probs = [0.2, 0.2, 0.2, 0.2, 0.2]
 
     return np.random.choice(states, p=probs)
 
