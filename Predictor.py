@@ -2,60 +2,85 @@ import yfinance as yf
 import numpy as np
 from scipy.stats import norm
 import pandas as pd
+from datetime import datetime, timedelta
+from pandas.tseries.holiday import USFederalHolidayCalendar
+from pandas.tseries.offsets import BDay
 
-# Preprocessing data
 
-# Fetch S&P 500 data
-sp500 = yf.download('^GSPC', start='2010-01-01', end='2025-02-07')
+# Adjust volatility window based on market conditions
+def get_adaptive_window(returns, min_window=10, max_window=30):
+    initial_vol = returns.std()
 
-# Calculate the next day's opening return based on previous day's close
-sp500['Next_Open_Return'] = sp500['Open'] / sp500['Close'].shift(1) - 1
+    recent_vol = returns.rolling(5, min_periods=1).std().fillna(initial_vol)
+    long_vol = returns.rolling(30, min_periods=5).std().fillna(initial_vol)
 
-# Calculate close to close returns
-sp500['Close_to_Close_Return'] = sp500['Close'].pct_change()
+    # Avoid division by zero and handle NaN values
+    long_vol = long_vol.replace(0, initial_vol)
+    vol_ratio = (recent_vol / long_vol).fillna(1)
+    vol_ratio = vol_ratio.replace([np.inf, -np.inf], 1)
 
-# Calculate logarithmic returns
-sp500['Log_Return'] = np.log(sp500['Close'] / sp500['Close'].shift(1))
+    # Shorter windows during high volatility periods
+    window_sizes = (max_window * vol_ratio.clip(0.5, 2))
+    window_sizes = window_sizes.round().astype(int)
+    window_sizes = window_sizes.clip(min_window, max_window)
 
-# Add volume feature
-sp500['Volume_Change'] = sp500['Volume'].pct_change()
+    # For the first few periods, use min_window
+    window_sizes.iloc[:5] = min_window
 
-# Calculate volatility (20-day rolling standard deviation of returns)
-sp500['Volatility'] = sp500['Log_Return'].rolling(window=20).std()
+    return window_sizes
+
+# Calculate adaptive thresholds
+def calculate_adaptive_thresholds(returns, prices):
+    # Ensure we're working with clean data
+    returns = returns.ffill().bfill()
+
+    # Calculate base volatility using EWMA for more responsiveness
+    base_vol = returns.ewm(span=20, min_periods=5).std()
+
+    # Add trend detection with proper handling of NaN values
+    prices_clean = prices.ffill()
+    trend = prices_clean.pct_change(periods=10).rolling(
+        window=10, min_periods=1
+    ).mean()
+
+    # Create trend factor with proper NaN handling
+    trend_factor = (1 + trend.abs().fillna(0)).clip(0.8, 1.2)
+
+    # Calculate final volatility adjustment
+    vol_adjusted = base_vol * trend_factor
+
+    # Ensure vol_adjusted is a Series
+    if isinstance(vol_adjusted, pd.DataFrame):
+        vol_adjusted = vol_adjusted.iloc[:, 0]
+
+    # Calculate thresholds with minimum values
+    big_threshold = (vol_adjusted * 0.5).clip(lower=0.0020, upper=0.0080)
+    small_threshold = (vol_adjusted * 0.25).clip(lower=0.0010, upper=0.0040)
+
+    # Final NaN cleanup
+    big_threshold = big_threshold.fillna(0.0020)
+    small_threshold = small_threshold.fillna(0.0010)
+
+    return {
+        'big': big_threshold,
+        'small': small_threshold
+    }
 
 # Categorize returns
-def categorize_next_open_state(ret):
-    if ret > 0.002:
+def categorize_next_open_state(ret, threshold_big, threshold_small):
+
+    if ret > threshold_big:
         return 'big_up'
-    elif 0.002 >= ret >= 0.001:
+    elif ret > threshold_small:
         return 'small_up'
-    elif ret < -0.002:
+    elif ret < -threshold_big:
         return 'big_down'
-    elif -0.002 <= ret <= -0.001:
+    elif ret < -threshold_small:
         return 'small_down'
     else:
         return 'flat'
 
-sp500['Next_Open_State'] = sp500['Next_Open_Return'].apply(categorize_next_open_state)
-
-# Convert relevant columns to float
-columns_to_convert = ['Next_Open_Return', 'Close_to_Close_Return', 'Volume_Change', 'Volatility']
-for col in columns_to_convert:
-    sp500[col] = pd.to_numeric(sp500[col], errors='coerce')
-
-# Remove the first row (NaN due to return calculation)
-sp500 = sp500.dropna()
-
-print(sp500.tail())
-print("\nDataset Shape:", sp500.shape)
-print("\nColumns:", sp500.columns.tolist())
-print("\nDate Range:")
-print("First Date:", sp500.index[0])
-print("Last Date:", sp500.index[-1])
-
 # MCMC
-
-states = ['big_up', 'small_up', 'flat', 'small_down', 'big_down']
 
 def log_likelihood(data, state, current_row):
     # Count transitions to the given state
@@ -88,14 +113,14 @@ def log_likelihood(data, state, current_row):
     return (np.log(state_count + 1) + np.log(close_return_prob + 1e-10) +
             np.log(volume_prob + 1e-10) + np.log(volatility_prob + 1e-10))
 
-def log_prior(state):
+def log_prior():
     return np.log(1/5)
 
-def adaptive_proposal(current_state, iteration, accepted):
+def adaptive_proposal(current_state, iteration, accepted, burn_in, states):
     current_index = states.index(current_state)
 
-    if iteration > 1000:
-        acceptance_rate = sum(accepted[-1000:]) / 1000
+    if iteration > burn_in:
+        acceptance_rate = sum(accepted[-burn_in:]) / burn_in
         if acceptance_rate > 0.234: # Optimal acceptance rate for many MCMC applications
             probs = [0.1 if i != current_index else 0.6 for i in range(5)]
         else:
@@ -105,16 +130,17 @@ def adaptive_proposal(current_state, iteration, accepted):
 
     return np.random.choice(states, p=probs)
 
-def adaptive_metropolis_hastings(data, current_row, n_iterations=100000, burn_in=10000):
+def adaptive_metropolis_hastings(data, current_row, n_iterations=10000, burn_in=1000):
+    states = ['big_up', 'small_up', 'flat', 'small_down', 'big_down']
     current_state = np.random.choice(states)
     samples = []
     accepted = []
 
     for i in range(n_iterations):
-        proposed_state = adaptive_proposal(current_state, i, accepted)
+        proposed_state = adaptive_proposal(current_state, i, accepted, burn_in, states)
 
-        current_log_posterior = log_likelihood(data, current_state, current_row) + log_prior(current_state)
-        proposed_log_posterior = log_likelihood(data, proposed_state, current_row) + log_prior(proposed_state)
+        current_log_posterior = log_likelihood(data, current_state, current_row) + log_prior()
+        proposed_log_posterior = log_likelihood(data, proposed_state, current_row) + log_prior()
 
         log_alpha = proposed_log_posterior - current_log_posterior
 
@@ -129,22 +155,113 @@ def adaptive_metropolis_hastings(data, current_row, n_iterations=100000, burn_in
 
     return samples
 
+def get_next_market_day(current_date):
+    cal = USFederalHolidayCalendar()
+    holidays = cal.holidays(start=current_date.strftime('%Y-%m-%d'), end=(current_date + timedelta(days=10)).strftime('%Y-%m-%d'))
+    next_day = pd.Timestamp(current_date.strftime('%Y-%m-%d')) + BDay(1)
+    while next_day in holidays or next_day.weekday() >= 5:
+        next_day = next_day + BDay(1)
+    return next_day
+
+def calculate_state_metrics(states, returns):
+    if len(states) == 0:
+        return {
+            'state_distribution': pd.Series(),
+            'state_stability': np.nan,
+            'extreme_capture': np.nan,
+            'false_signals': np.nan
+        }
+
+    metrics = {
+        'state_distribution': states.value_counts(normalize=True),
+        'state_stability': 1 - (states != states.shift()).mean(),
+        'extreme_capture': (
+            (states.isin(['big_up', 'big_down'])) &
+            (returns.abs() > returns.std() * 2)
+        ).mean(),
+        'false_signals': (
+            (states.isin(['big_up', 'big_down'])) &
+            (returns.abs() < returns.std())
+        ).mean()
+    }
+    return metrics
+
 # Apply
+def analyze_market_data(start_date='2010-01-01'):
+    current_date = datetime.now()
 
-def make_prediction(data):
-    # Use the last row of the data as the current row
-    current_row = data.iloc[-1]
+    # Fetch S&P 500 data
+    sp500 = yf.download('^GSPC', start=start_date,
+                        end=(current_date + timedelta(days=1)).strftime('%Y-%m-%d'))
 
-    # Run the adaptive Metropolis-Hastings MCMC
-    mcmc_samples = adaptive_metropolis_hastings(data, current_row, n_iterations=10000, burn_in=1000)
+    # Calculate returns
+    sp500['Next_Open_Return'] = sp500['Open'] / sp500['Close'].shift(1) - 1
+    sp500['Close_to_Close_Return'] = sp500['Close'].pct_change()
+    sp500['Log_Return'] = np.log(sp500['Close'] / sp500['Close'].shift(1))
+    sp500['Volume_Change'] = sp500['Volume'].pct_change()
+    sp500['Volatility'] = sp500['Log_Return'].ewm(span=20, min_periods=5).std()
 
-    # Determine the most frequent state in the MCMC samples
+    # Calculate adaptive thresholds
+    thresholds = calculate_adaptive_thresholds(sp500['Log_Return'], sp500['Close'])
+
+    # Apply state classification
+    states = []
+    for i in range(len(sp500)):
+        threshold_big = float(thresholds['big'].iat[i])
+        threshold_small = float(thresholds['small'].iat[i])
+
+        state = categorize_next_open_state(
+            float(sp500['Next_Open_Return'].iat[i]),
+            threshold_big,
+            threshold_small
+        )
+        states.append(state)
+
+    sp500['Next_Open_State'] = states
+
+    print(sp500.tail())
+    print("\nDate Range:")
+    print("First Date:", sp500.index[0])
+    print("Last Date:", sp500.index[-1])
+
+    # Convert relevant columns to float
+    columns_to_convert = ['Next_Open_Return', 'Close_to_Close_Return',
+                          'Volume_Change', 'Volatility']
+    for col in columns_to_convert:
+        sp500[col] = pd.to_numeric(sp500[col], errors='coerce')
+
+    # Remove NaN rows
+    sp500 = sp500.dropna()
+
+    # Calculate performance metrics
+    metrics = calculate_state_metrics(sp500['Next_Open_State'], sp500['Next_Open_Return'])
+
+    # Make prediction for next market day
+    current_row = sp500.iloc[-1:].copy()
+    mcmc_samples = adaptive_metropolis_hastings(sp500, current_row)
     prediction = max(set(mcmc_samples), key=mcmc_samples.count)
+    next_market_day = get_next_market_day(sp500.index[-1])
 
-    next_day = data.index[-1] + pd.Timedelta(days=1)
+    return {
+        'prediction': prediction,
+        'next_market_day': next_market_day,
+        'metrics': metrics,
+        'thresholds': {
+            'big': float(thresholds['big'].iloc[-1]),
+            'small': float(thresholds['small'].iloc[-1])
+        },
+        'data': sp500
+    }
 
-    return prediction, next_day
 
-# Assuming 'sp500' is your preprocessed DataFrame
-prediction, next_day = make_prediction(sp500)
-print(f"Predicted opening state for {next_day.strftime('%A, %B %d, %Y')}: {prediction}")
+if __name__ == "__main__":
+    results = analyze_market_data()
+
+    print(f"\nPredicted state for {results['next_market_day'].strftime('%A, %B %d, %Y')}: "
+          f"{results['prediction']}")
+    print("\nCurrent thresholds:")
+    print(f"Big move: ±{results['thresholds']['big'] * 100:.2f}%")
+    print(f"Small move: ±{results['thresholds']['small'] * 100:.2f}%")
+    print("\nPerformance metrics:")
+    for metric, value in results['metrics'].items():
+        print(f"{metric}: {value}")
